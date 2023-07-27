@@ -1521,6 +1521,11 @@ func (h *jobsInsertHandler) addQueryResultToDynamicDestinationTable(ctx context.
 	if err := r.server.contentRepo.AddTableData(ctx, tx, projectID, datasetID, tableDef); err != nil {
 		return fmt.Errorf("failed to add table data: %w", err)
 	}
+	r.job.Configuration.Query.DestinationTable = &bigqueryv2.TableReference{
+		DatasetId: datasetID,
+		ProjectId: projectID,
+		TableId:   tableID,
+	}
 	return nil
 }
 
@@ -2338,6 +2343,13 @@ func (h *tablesGetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	project := projectFromContext(ctx)
 	dataset := datasetFromContext(ctx)
 	table := tableFromContext(ctx)
+
+	err := server.SyncRepos(ctx, project.ID, dataset.ID)
+	if err != nil {
+		errorResponse(ctx, w, errBackendError(fmt.Sprintf("failed to sync metadata repo with error: %s", err.Error())))
+		return
+	}
+
 	res, err := h.Handle(ctx, &tablesGetRequest{
 		server:  server,
 		project: project,
@@ -2498,11 +2510,24 @@ func (h *tablesListHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	server := serverFromContext(ctx)
 	project := projectFromContext(ctx)
 	dataset := datasetFromContext(ctx)
+	dataset, err := server.metaRepo.FindDataset(ctx, project.ID, dataset.ID)
+	if err != nil {
+		errorResponse(ctx, w, errInternalError(err.Error()))
+		return
+	}
+
+	err = server.SyncRepos(ctx, project.ID, dataset.ID)
+	if err != nil {
+		errorResponse(ctx, w, errBackendError(fmt.Sprintf("failed to sync metadata repo with error: %s", err.Error())))
+		return
+	}
+
 	res, err := h.Handle(ctx, &tablesListRequest{
 		server:  server,
 		project: project,
 		dataset: dataset,
 	})
+
 	if err != nil {
 		errorResponse(ctx, w, errInternalError(err.Error()))
 		return
@@ -2553,6 +2578,12 @@ func (h *tablesPatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&newTable); err != nil {
 		errorResponse(ctx, w, errInvalid(err.Error()))
 		return
+	}
+
+	newTable.TableReference = &bigqueryv2.TableReference{
+		DatasetId: dataset.ID,
+		ProjectId: project.ID,
+		TableId:   table.ID,
 	}
 	res, err := h.Handle(ctx, &tablesPatchRequest{
 		server:   server,

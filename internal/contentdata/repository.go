@@ -136,8 +136,12 @@ func (r *Repository) encodeSchemaField(field *bigqueryv2.TableFieldSchema) strin
 		elem = types.Type(field.Type).ZetaSQLTypeKind().String()
 	}
 	if field.Mode == "REPEATED" {
-		return fmt.Sprintf("ARRAY<%s>", elem)
+		elem = fmt.Sprintf("ARRAY<%s>", elem)
 	}
+	if field.Mode == "REQUIRED" {
+		elem = fmt.Sprintf("%s NOT NULL", elem)
+	}
+
 	return elem
 }
 

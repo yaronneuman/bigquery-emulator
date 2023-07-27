@@ -27,7 +27,8 @@ func recoveryMiddleware(s *Server) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
-				if err := recover(); err != nil {
+				err := recover()
+				if err != nil {
 					ctx := logger.WithLogger(r.Context(), s.logger)
 					errorResponse(ctx, w, errInternalError(fmt.Sprintf("%+v", err)))
 					return
@@ -223,15 +224,28 @@ func withJobMiddleware() func(http.Handler) http.Handler {
 	}
 }
 
-func withTableMiddleware() func(http.Handler) http.Handler {
+func withTableMiddleware(s *Server) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 			params := mux.Vars(r)
 			tableID, exists := tableIDFromParams(params)
+
 			if exists {
 				dataset := datasetFromContext(ctx)
 				table := dataset.Table(tableID)
+				if table == nil {
+					if project := projectFromContext(ctx); project != nil {
+						if dataset := datasetFromContext(ctx); dataset != nil {
+							err := s.SyncRepos(ctx, project.ID, dataset.ID)
+							if err != nil {
+								errorResponse(ctx, w, errBackendError(fmt.Sprintf("failed to sync metadata repo with error: %s", err.Error())))
+								return
+							}
+						}
+					}
+				}
+				table = dataset.Table(tableID)
 				if table == nil {
 					errorResponse(ctx, w, errNotFound(fmt.Sprintf("table %s is not found", tableID)))
 					return

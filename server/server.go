@@ -4,10 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/goccy/bigquery-emulator/types"
+	"github.com/goccy/go-json"
+	"github.com/goccy/go-zetasqlite/zeta"
+	bigqueryv2 "google.golang.org/api/bigquery/v2"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -91,7 +96,7 @@ func New(storage Storage) (*Server, error) {
 	r.Use(withProjectMiddleware())
 	r.Use(withDatasetMiddleware())
 	r.Use(withJobMiddleware())
-	r.Use(withTableMiddleware())
+	r.Use(withTableMiddleware(server))
 	r.Use(withModelMiddleware())
 	r.Use(withRoutineMiddleware())
 	server.Handler = r
@@ -245,5 +250,179 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
 	}
+	return nil
+}
+
+func (s *Server) SyncRepos(ctx context.Context, projectId, datasetId string) error {
+	dataset, err := s.metaRepo.FindDataset(ctx, projectId, datasetId)
+	if err != nil {
+		return err
+	}
+
+	datasetId = dataset.ID
+	if err != nil {
+		return err
+	}
+
+	conn, err := s.connMgr.Connection(ctx, projectId, datasetId)
+	if err != nil {
+		return err
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Commit()
+
+	// list tables in zetasqlite
+	tables, err := s.contentRepo.Query(ctx, tx, projectId, datasetId, "SHOW TABLES", []*bigqueryv2.QueryParameter{})
+	if err != nil {
+		return err
+	}
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
+
+	for _, table := range tables.Rows {
+		data, err := table.Data()
+		if err != nil {
+			return err
+		}
+
+		tablePath := data["name"].(string)
+		tableParts := strings.SplitN(tablePath, "_", 3)
+		if len(tableParts) != 3 || tableParts[0] != projectId || tableParts[1] != datasetId {
+			continue
+		}
+
+		// Skip if table exist
+		tableId := tableParts[2]
+		existingTable, err := s.metaRepo.FindTable(ctx, projectId, datasetId, tableId)
+		if err != nil {
+			return err
+		}
+
+		if existingTable != nil {
+			continue
+		}
+
+		// Describe
+		conn, err := s.connMgr.Connection(ctx, projectId, datasetId)
+		if err != nil {
+			return err
+		}
+
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Commit()
+
+		specs, err := s.contentRepo.Query(ctx, tx, projectId, datasetId,
+			fmt.Sprintf("DESCRIBE TABLE %s", tablePath),
+			[]*bigqueryv2.QueryParameter{})
+		if err != nil {
+			return err
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			return err
+		}
+
+		// if we have the spec, insert to metadata repo.
+		for _, row := range specs.Rows {
+			spec, err := row.Data()
+			if err != nil {
+				return err
+			}
+
+			specStr := spec["spec"].(string)
+			var zetaTable zeta.TableSpec
+			err = json.Unmarshal([]byte(specStr), &zetaTable)
+			if err != nil {
+				return err
+			}
+
+			fields := make([]*bigqueryv2.TableFieldSchema, 0, len(zetaTable.Columns))
+			for _, column := range zetaTable.Columns {
+				columnZetaType, err := column.Type.ToZetaSQLType()
+				if err != nil {
+					return err
+				}
+				field := types.TableFieldSchemaFromZetaSQLType(column.Name, columnZetaType)
+				if column.IsNotNull {
+					field.Mode = "REQUIRED"
+				}
+				fields = append(fields, field)
+			}
+			bqTable := &bigqueryv2.Table{
+				Type: "TABLE",
+				Kind: "bigquery#table",
+				Id:   fmt.Sprintf("%s:%s.%s", projectId, datasetId, tableId),
+				TableReference: &bigqueryv2.TableReference{
+					ProjectId: projectId,
+					DatasetId: datasetId,
+					TableId:   tableId,
+				},
+				Schema: &bigqueryv2.TableSchema{
+					Fields: fields,
+				},
+				SelfLink: fmt.Sprintf(
+					"http://%s/bigquery/v2/projects/%s/datasets/%s/tables/%s",
+					s.httpServer.Addr,
+					projectId,
+					datasetId,
+					tableId,
+				),
+			}
+
+			encodedTableData, err := json.Marshal(bqTable)
+			if err != nil {
+				return err
+			}
+			var tableMetadata map[string]interface{}
+			if err := json.Unmarshal(encodedTableData, &tableMetadata); err != nil {
+				return err
+			}
+
+			metaTable := metadata.NewTable(
+				s.metaRepo,
+				projectId,
+				datasetId,
+				tableId,
+				tableMetadata,
+			)
+
+			conn, err := s.connMgr.Connection(ctx, projectId, datasetId)
+			if err != nil {
+				return err
+			}
+
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Commit()
+			if existingTable != nil {
+				err := s.metaRepo.UpdateTable(ctx, tx.Tx(), metaTable)
+				if err != nil {
+					return err
+				}
+			} else {
+				err = dataset.AddTable(ctx, tx.Tx(), metaTable)
+				if err != nil {
+					return err
+				}
+			}
+			err = tx.Commit()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }

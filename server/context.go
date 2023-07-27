@@ -37,7 +37,10 @@ func withDataset(ctx context.Context, dataset *metadata.Dataset) context.Context
 }
 
 func datasetFromContext(ctx context.Context) *metadata.Dataset {
-	return ctx.Value(datasetKey{}).(*metadata.Dataset)
+	if dataset, ok := ctx.Value(datasetKey{}).(*metadata.Dataset); ok {
+		return dataset
+	}
+	return nil
 }
 
 func withJob(ctx context.Context, job *metadata.Job) context.Context {
