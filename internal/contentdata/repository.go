@@ -43,10 +43,12 @@ func (r *Repository) getConnection(ctx context.Context, projectID, datasetID str
 			return fmt.Errorf("failed to get ZetaSQLiteConn from %T", c)
 		}
 		if datasetID == "" {
-			zetasqliteConn.SetNamePath([]string{projectID})
+			_ = zetasqliteConn.SetNamePath([]string{projectID})
 		} else {
-			zetasqliteConn.SetNamePath([]string{projectID, datasetID})
+			_ = zetasqliteConn.SetNamePath([]string{projectID, datasetID})
 		}
+		const maxNamePath = 3 // projectID and datasetID and tableID
+		zetasqliteConn.SetMaxNamePath(maxNamePath)
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("failed to setup connection: %w", err)
@@ -177,6 +179,10 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 		return nil, err
 	}
 	defer rows.Close()
+	changedCatalog, err := zetasqlite.ChangedCatalogFromRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get changed catalog: %w", err)
+	}
 	colNames, err := rows.Columns()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %w", err)
@@ -243,10 +249,11 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 		Schema: &bigqueryv2.TableSchema{
 			Fields: fields,
 		},
-		TotalRows:   uint64(len(tableRows)),
-		JobComplete: true,
-		Rows:        tableRows,
-		TotalBytes:  totalBytes,
+		TotalRows:      uint64(len(tableRows)),
+		JobComplete:    true,
+		Rows:           tableRows,
+		TotalBytes:     totalBytes,
+		ChangedCatalog: changedCatalog,
 	}, nil
 }
 

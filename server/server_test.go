@@ -70,7 +70,7 @@ func TestSimpleQuery(t *testing.T) {
 				}
 				t.Fatal(err)
 			}
-			fmt.Println("row = ", row)
+			t.Log("row = ", row)
 		}
 	})
 }
@@ -366,7 +366,7 @@ func TestQuery(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		fmt.Println("row = ", row)
+		t.Log("row = ", row)
 	}
 }
 
@@ -521,6 +521,75 @@ func TestTable(t *testing.T) {
 		ExpirationTime: time.Now().Add(1 * time.Hour),
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDirectDDL(t *testing.T) {
+	const (
+		projectID = "test"
+		datasetID = "dataset1"
+		tableID   = "foo"
+	)
+
+	ctx := context.Background()
+	bqServer, err := server.New(server.TempStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := types.NewProject(projectID, types.NewDataset(datasetID))
+	if err := bqServer.Load(server.StructSource(project)); err != nil {
+		t.Fatal(err)
+	}
+
+	testServer := bqServer.TestServer()
+	defer func() {
+		testServer.Close()
+		bqServer.Stop(ctx)
+	}()
+
+	client, err := bigquery.NewClient(
+		ctx,
+		projectID,
+		option.WithEndpoint(testServer.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	tableName := fmt.Sprintf("%s.%s.%s", projectID, datasetID, tableID)
+	if _, err := client.Query(fmt.Sprintf("CREATE TABLE %s(name STRING)", tableName)).Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tableIter := client.Dataset(datasetID).Tables(ctx)
+	table, err := tableIter.Next()
+	if err != nil {
+		if err != iterator.Done {
+			t.Fatal(err)
+		}
+	}
+	if table == nil {
+		t.Fatal("failed to get created table")
+	}
+	if table.TableID != tableID {
+		t.Fatalf("failed to get table. got table-id is %s", table.TableID)
+	}
+	if _, err := client.Query(`DROP TABLE test.dataset1.foo`).Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tableIter = client.Dataset(datasetID).Tables(ctx)
+	var tableCount int
+	for {
+		if _, err := tableIter.Next(); err != nil {
+			if err == iterator.Done {
+				break
+			}
+			t.Fatal(err)
+		}
+		tableCount++
+	}
+	if tableCount != 0 {
+		t.Fatalf("failed to drop table. table count is %d", tableCount)
 	}
 }
 
@@ -814,7 +883,7 @@ func TestDataFromStruct(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		fmt.Println("row = ", row)
+		t.Log("row = ", row)
 	}
 	if err := client.Dataset("dataset1").DeleteWithContents(ctx); err != nil {
 		t.Fatal(err)
@@ -921,7 +990,7 @@ func TestMultiDatasets(t *testing.T) {
 				}
 				t.Fatal(err)
 			}
-			fmt.Println("row = ", row)
+			t.Log("row = ", row)
 		}
 	}
 	{
@@ -941,7 +1010,7 @@ func TestMultiDatasets(t *testing.T) {
 				}
 				t.Fatal(err)
 			}
-			fmt.Println("row = ", row)
+			t.Log("row = ", row)
 		}
 	}
 	{
@@ -2041,9 +2110,211 @@ ORDER BY qty DESC;`)
 			}
 		}
 		rowCount++
-		fmt.Println(row)
+		t.Log(row)
 	}
 	if rowCount != 1 {
 		t.Fatal("failed to get result")
 	}
+}
+
+func TestMultipleProject(t *testing.T) {
+	const (
+		mainProjectID = "main_project"
+		mainDatasetID = "main_dataset"
+		mainTableID   = "main_table"
+		subProjectID  = "sub_project"
+		subDatasetID  = "sub_dataset"
+		subTableID    = "sub_table"
+	)
+
+	ctx := context.Background()
+
+	bqServer, err := server.New(server.TempStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bqServer.Load(
+		server.StructSource(
+			types.NewProject(
+				mainProjectID,
+				types.NewDataset(
+					mainDatasetID,
+					types.NewTable(
+						mainTableID,
+						[]*types.Column{
+							types.NewColumn("name", types.STRING),
+						},
+						types.Data{
+							{"name": "main-project-name-data"},
+						},
+					),
+				),
+			),
+		),
+		server.StructSource(
+			types.NewProject(
+				subProjectID,
+				types.NewDataset(
+					subDatasetID,
+					types.NewTable(
+						subTableID,
+						[]*types.Column{
+							types.NewColumn("name", types.STRING),
+						},
+						types.Data{
+							{"name": "sub-project-name-data"},
+						},
+					),
+				),
+			),
+		),
+	); err != nil {
+		t.Fatal(err)
+	}
+	testServer := bqServer.TestServer()
+	defer func() {
+		testServer.Close()
+		bqServer.Stop(ctx)
+	}()
+
+	client, err := bigquery.NewClient(
+		ctx,
+		mainProjectID,
+		option.WithEndpoint(testServer.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	it, err := client.Query("SELECT * FROM sub_project.sub_dataset.sub_table").Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row []bigquery.Value
+	if err := it.Next(&row); err != nil {
+		if err != iterator.Done {
+			t.Fatal(err)
+		}
+	}
+	if len(row) != 1 {
+		t.Fatalf("failed to get row. got length %d", len(row))
+	}
+	name, ok := row[0].(string)
+	if !ok {
+		t.Fatalf("failed to get row[0]. type is %T", row[0])
+	}
+	if name != "sub-project-name-data" {
+		t.Fatalf("failed to get data from sub project: %s", name)
+	}
+}
+
+func TestInformationSchema(t *testing.T) {
+	const (
+		projectID    = "test"
+		datasetID    = "test_dataset"
+		subProjectID = "sub"
+	)
+
+	ctx := context.Background()
+
+	bqServer, err := server.New(server.TempStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bqServer.Load(
+		server.StructSource(
+			types.NewProject(
+				projectID,
+				types.NewDataset(
+					datasetID,
+					types.NewTable(
+						"INFORMATION_SCHEMA.COLUMNS",
+						[]*types.Column{
+							types.NewColumn("table_schema", types.STRING),
+							types.NewColumn("table_name", types.STRING),
+							types.NewColumn("column_name", types.STRING),
+						},
+						types.Data{
+							{
+								"table_schema": "test_ds",
+								"table_name":   "table_type_graph",
+								"column_name":  "id",
+							},
+						},
+					),
+				),
+			),
+			types.NewProject(subProjectID),
+		),
+	); err != nil {
+		t.Fatal(err)
+	}
+	testServer := bqServer.TestServer()
+	defer func() {
+		testServer.Close()
+		bqServer.Stop(ctx)
+	}()
+
+	t.Run("query from same project", func(t *testing.T) {
+		client, err := bigquery.NewClient(
+			ctx,
+			projectID,
+			option.WithEndpoint(testServer.URL),
+			option.WithoutAuthentication(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+
+		it, err := client.Query("SELECT * FROM test_dataset.INFORMATION_SCHEMA.COLUMNS").Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			var row []bigquery.Value
+			if err := it.Next(&row); err != nil {
+				if err != iterator.Done {
+					t.Fatal(err)
+				}
+				break
+			}
+			if len(row) != 3 {
+				t.Fatalf("failed to get row: %v", row)
+			}
+		}
+	})
+
+	t.Run("query from sub project", func(t *testing.T) {
+		client, err := bigquery.NewClient(
+			ctx,
+			subProjectID,
+			option.WithEndpoint(testServer.URL),
+			option.WithoutAuthentication(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+
+		it, err := client.Query("SELECT * FROM test.test_dataset.INFORMATION_SCHEMA.COLUMNS").Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			var row []bigquery.Value
+			if err := it.Next(&row); err != nil {
+				if err != iterator.Done {
+					t.Fatal(err)
+				}
+				break
+			}
+			if len(row) != 3 {
+				t.Fatalf("failed to get row: %v", row)
+			}
+		}
+	})
+
 }
